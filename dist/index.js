@@ -20342,7 +20342,7 @@ function createApiClient(options) {
 		baseUrl: apiUrl,
 		...token === void 0 ? {} : { auth: token },
 		userAgent: "pr-baseline",
-		request: { fetch: options.fetch },
+		request: { fetch: rejectEmptyGraphql(options.fetch, graphqlUrl) },
 		retry: {
 			doNotRetry: DO_NOT_RETRY,
 			retries: RETRIES,
@@ -20375,6 +20375,35 @@ function createApiClient(options) {
 			return envelope.data;
 		}
 	};
+}
+/**
+* Turns a 200 GraphQL response without data or errors (an empty or truncated body) into a 502.
+* The retry plugin then retries it, and a final failure carries the body instead of a TypeError.
+*/
+function rejectEmptyGraphql(fetcher, graphqlUrl) {
+	return async (input, init) => {
+		const response = await fetcher(input, init);
+		if ((input instanceof Request ? input.url : String(input)) !== graphqlUrl || response.status !== 200) return response;
+		const text = await response.clone().text();
+		if (hasDataOrErrors(text)) return response;
+		const message = `GraphQL returned 200 without data: ${JSON.stringify(text.slice(0, 200))}`;
+		const headers = new Headers(response.headers);
+		headers.delete("content-length");
+		headers.delete("content-encoding");
+		headers.set("content-type", "application/json; charset=utf-8");
+		return new Response(JSON.stringify({ message }), {
+			status: 502,
+			headers
+		});
+	};
+}
+function hasDataOrErrors(text) {
+	try {
+		const envelope = JSON.parse(text);
+		return typeof envelope?.data === "object" && envelope.data !== null || Array.isArray(envelope?.errors) && envelope.errors.length > 0;
+	} catch {
+		return false;
+	}
 }
 /** Maps an Octokit failure onto the tool's classification; other errors pass through unchanged. */
 function translate(error, path) {
@@ -20444,23 +20473,42 @@ function repoParts(repo) {
 		repo: name
 	};
 }
-const OPEN_PULLS_QUERY = `
+/** The branch a PR lands on: its stack's base, which GitHub enforces the base's rules for, or its own base. */
+function targetBase(pull) {
+	return pull.stackBaseRef ?? pull.baseRef;
+}
+const PULL_FIELDS = `
+	number
+	isDraft
+	headRefOid
+	baseRefName
+	headRepository { nameWithOwner }
+	commits(last: 1) {
+		nodes { commit { status { context(name: $context) { state description targetUrl creator { login __typename } } } } }
+	}
+`;
+const ENTRY_FIELDS = `pageInfo { hasNextPage endCursor } nodes { pullRequest { id number state } }`;
+const STACK_FIELDS = `
+	stack { id baseRefName entries(first: 100) { ${ENTRY_FIELDS} } }
+`;
+const STACK_ENTRIES_QUERY = `
+	query ($id: ID!, $cursor: String) {
+		node(id: $id) { ... on PullRequestStack { entries(first: 100, after: $cursor) { ${ENTRY_FIELDS} } } }
+	}
+`;
+const openPullsQuery = (stacks) => `
 	query ($owner: String!, $name: String!, $base: String!, $context: String!, $cursor: String) {
 		repository(owner: $owner, name: $name) {
 			pullRequests(states: OPEN, baseRefName: $base, first: 100, after: $cursor, orderBy: { field: UPDATED_AT, direction: DESC }) {
 				pageInfo { hasNextPage endCursor }
-				nodes {
-					number
-					isDraft
-					headRefOid
-					baseRefName
-					headRepository { nameWithOwner }
-					commits(last: 1) {
-						nodes { commit { status { context(name: $context) { state description targetUrl creator { login __typename } } } } }
-					}
-				}
+				nodes { ${PULL_FIELDS} ${stacks ? STACK_FIELDS : ""} }
 			}
 		}
+	}
+`;
+const PULL_NODES_QUERY = `
+	query ($ids: [ID!]!, $context: String!) {
+		nodes(ids: $ids) { ... on PullRequest { ${PULL_FIELDS} stack { baseRefName } } }
 	}
 `;
 const LABELED_MERGES_QUERY = `
@@ -20482,30 +20530,83 @@ const COMMIT_STATUS_QUERY = `
 		}
 	}
 `;
-/** Lists open PRs against `base` with each head's latest status for `context`, one page per 100 PRs. */
+/**
+* Lists open PRs that land on `base` with each head's latest status for `context`, one page per 100 PRs.
+* A stack's upper PRs target other branches, so they are reached through the stack of the PR at its bottom.
+*/
 async function listOpenPulls(api, repo, input) {
 	const [owner, name] = repo.split("/");
-	const pulls = [];
+	const pulls = /* @__PURE__ */ new Map();
+	const stacked = /* @__PURE__ */ new Map();
+	const seenStacks = /* @__PURE__ */ new Set();
+	let stacks = true;
 	let cursor = null;
 	for (;;) {
-		const page = (await api.graphql(OPEN_PULLS_QUERY, {
+		const variables = {
 			owner,
 			name,
 			base: input.base,
 			context: input.context,
 			cursor
-		})).repository.pullRequests;
-		for (const node of page.nodes) pulls.push({
-			number: node.number,
-			headSha: node.headRefOid,
-			isDraft: node.isDraft,
-			baseRef: node.baseRefName,
-			headRepo: node.headRepository?.nameWithOwner ?? null,
-			status: toRecord(node.commits.nodes[0]?.commit.status?.context ?? null)
-		});
-		if (!page.pageInfo.hasNextPage) return pulls;
+		};
+		let data;
+		try {
+			data = await api.graphql(openPullsQuery(stacks), variables);
+		} catch (error) {
+			if (!stacks || !lacksStacks(error)) throw error;
+			stacks = false;
+			continue;
+		}
+		const page = data.repository.pullRequests;
+		for (const node of page.nodes) {
+			pulls.set(node.number, toOpenPull(node));
+			if (node.stack?.baseRefName === input.base && !seenStacks.has(node.stack.id)) {
+				seenStacks.add(node.stack.id);
+				for (const entry of await stackEntries(api, node.stack.id, node.stack.entries)) if (entry.state === "OPEN") stacked.set(entry.number, entry.id);
+			}
+		}
+		if (!page.pageInfo.hasNextPage) break;
 		cursor = page.pageInfo.endCursor;
 	}
+	const missing = [...stacked].filter(([number]) => !pulls.has(number)).map(([, id]) => id);
+	for (let index = 0; index < missing.length; index += 100) {
+		const data = await api.graphql(PULL_NODES_QUERY, {
+			ids: missing.slice(index, index + 100),
+			context: input.context
+		});
+		for (const node of data.nodes) if (node !== null) pulls.set(node.number, toOpenPull(node));
+	}
+	return [...pulls.values()];
+}
+/** Every entry of a stack, continuing past the page the listing returned. */
+async function stackEntries(api, id, first) {
+	const entries = first.nodes.map((node) => node.pullRequest);
+	let page = first;
+	while (page.pageInfo.hasNextPage) {
+		const data = await api.graphql(STACK_ENTRIES_QUERY, {
+			id,
+			cursor: page.pageInfo.endCursor
+		});
+		if (data.node === null) break;
+		page = data.node.entries;
+		entries.push(...page.nodes.map((node) => node.pullRequest));
+	}
+	return entries;
+}
+function toOpenPull(node) {
+	return {
+		number: node.number,
+		headSha: node.headRefOid,
+		isDraft: node.isDraft,
+		baseRef: node.baseRefName,
+		stackBaseRef: node.stack?.baseRefName ?? null,
+		headRepo: node.headRepository?.nameWithOwner ?? null,
+		status: toRecord(node.commits.nodes[0]?.commit.status?.context ?? null)
+	};
+}
+/** GitHub names the unknown field in the error; GHES before stacks has no `stack` on a PR. */
+function lacksStacks(error) {
+	return isGitHubError(error) && /Field 'stack' doesn't exist/.test(error.body);
 }
 /** Merge commits of every merged PR against `base` that carries `label`, newest first, exhaustively. */
 async function listLabeledMergeCommits(api, repo, input) {
@@ -20542,13 +20643,15 @@ async function getPull(api, repo, number) {
 			...repoParts(repo),
 			pull_number: number
 		});
+		const stack = pull.data.stack;
 		return {
 			number: pull.data.number,
 			state: pull.data.state,
 			merged: pull.data.merged,
 			draft: pull.data.draft ?? false,
 			headSha: pull.data.head.sha,
-			baseRef: pull.data.base.ref
+			baseRef: pull.data.base.ref,
+			stackBaseRef: stack?.base.ref ?? null
 		};
 	} catch (error) {
 		if (isGitHubError(error, "not-found")) return null;
@@ -20764,7 +20867,7 @@ async function resolveTarget(runtime, options) {
 		if (pull === null) throw new ConfigError(`Pull request #${options.pr} was not found in ${config.repo}.`);
 		return {
 			sha: pull.headSha,
-			baseRef: pull.baseRef,
+			baseRef: targetBase(pull),
 			fromEvent: true
 		};
 	}
@@ -21130,7 +21233,7 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 		const list = async () => (await listOpenPulls(api, config.repo, {
 			base,
 			context: config.context
-		})).filter((pull) => pull.baseRef === base && (config.includeDrafts || !pull.isDraft));
+		})).filter((pull) => targetBase(pull) === base && (config.includeDrafts || !pull.isDraft));
 		let inScope = await list();
 		knownOpenPulls = inScope.length;
 		knownSelected = inScope.filter((pull) => selects(pull, scope)).length;
@@ -21384,7 +21487,7 @@ function selects(pull, scope) {
 async function reconcile(runtime, listed, fetched, base) {
 	const current = await getPull(runtime.api, runtime.config.repo, listed.number);
 	if (current === null || current.state !== "open") return "closed";
-	if (current.baseRef !== base || !runtime.config.includeDrafts && current.draft) {
+	if (targetBase(current) !== base || !runtime.config.includeDrafts && current.draft) {
 		runtime.logger.info(`PR #${listed.number} left the refresh's scope while it was preparing.`);
 		return "outOfScope";
 	}
@@ -21583,7 +21686,7 @@ async function runReport(runtime) {
 	const pulls = (await listOpenPulls(api, config.repo, {
 		base,
 		context: config.context
-	})).filter((pull) => pull.baseRef === base && (config.includeDrafts || !pull.isDraft));
+	})).filter((pull) => targetBase(pull) === base && (config.includeDrafts || !pull.isDraft));
 	const prepared = await ancestry.prepare?.({
 		shas: [head],
 		pulls: pulls.map((pull) => pull.number),
@@ -22183,7 +22286,7 @@ function auto(event, base, token) {
 			if (event.payload["action"] !== "closed") return {
 				mode: "refresh-pr-status",
 				sha: pull.head.sha,
-				baseRef: pull.base.ref,
+				baseRef: pull.stack?.base.ref ?? pull.base.ref,
 				report: true
 			};
 			if (pull.merged !== true) return {
@@ -22210,7 +22313,7 @@ function auto(event, base, token) {
 			return {
 				mode: "refresh-pr-status",
 				sha: pull.head.sha,
-				baseRef: pull.base.ref,
+				baseRef: pull.stack?.base.ref ?? pull.base.ref,
 				report
 			};
 		}
